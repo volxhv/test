@@ -1,0 +1,12 @@
+services:
+  ansible:
+    build:
+      context: .
+      dockerfile: control.Dockerfile
+    environment:
+      PROJECT_DIR: ${PROJECT_DIR:?Set PROJECT_DIR to the absolute host path}
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/project
+      - ${PROJECT_DIR}:${PROJECT_DIR}

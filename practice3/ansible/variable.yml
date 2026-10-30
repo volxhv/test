@@ -1,0 +1,20 @@
+---
+- name: Найти переменную {{ ci_var.key }}
+  ansible.builtin.uri:
+    url: "{{ api }}/projects/{{ project_id }}/variables/{{ ci_var.key }}"
+    headers: {PRIVATE-TOKEN: "{{ gitlab_token }}"}
+    status_code: [200, 404]
+  register: existing_variable
+- name: Создать или обновить переменную {{ ci_var.key }}
+  ansible.builtin.uri:
+    url: "{{ api }}/projects/{{ project_id }}/variables{{ '/' + ci_var.key if existing_variable.status == 200 else '' }}"
+    method: "{{ 'PUT' if existing_variable.status == 200 else 'POST' }}"
+    headers: {PRIVATE-TOKEN: "{{ gitlab_token }}"}
+    body_format: json
+    body:
+      key: "{{ ci_var.key }}"
+      value: "{{ ci_var.value }}"
+      variable_type: "{{ ci_var.variable_type }}"
+      protected: true
+      masked: "{{ ci_var.masked }}"
+    status_code: [200, 201]

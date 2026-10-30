@@ -1,0 +1,57 @@
+services:
+  gitlab:
+    image: gitlab/gitlab-ce:17.11.7-ce.0
+    hostname: gitlab
+    shm_size: 256m
+    restart: unless-stopped
+    ports: ["8080:80", "5050:5050", "2224:22"]
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'http://localhost:8080'
+        nginx['listen_port'] = 80
+        gitlab_rails['gitlab_shell_ssh_port'] = 2224
+        registry_external_url 'http://localhost:5050'
+        registry_nginx['listen_port'] = 5050
+        gitlab_rails['gitlab_default_projects_features_container_registry'] = true
+        prometheus_monitoring['enable'] = false
+    volumes:
+      - gitlab_config:/etc/gitlab
+      - gitlab_logs:/var/log/gitlab
+      - gitlab_data:/var/opt/gitlab
+    networks: [lab]
+  runner:
+    image: gitlab/gitlab-runner:alpine-v17.11.1
+    restart: unless-stopped
+    volumes:
+      - runner_config:/etc/gitlab-runner
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks: [lab]
+  deploy:
+    build:
+      context: ${PROJECT_DIR:?}/infra
+      dockerfile: deploy.Dockerfile
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PROJECT_DIR:?}/secrets/id_ed25519.pub:/root/.ssh/authorized_keys:ro
+      - deploy_data:/opt/devops-stack
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    ports: ["2222:22"]
+    networks: [lab]
+  gateway:
+    build:
+      context: ${PROJECT_DIR:?}/infra
+      dockerfile: gateway.Dockerfile
+    container_name: practice3-gateway
+    restart: unless-stopped
+    ports: ["8443:8443"]
+    networks: [lab]
+volumes:
+  gitlab_config:
+  gitlab_logs:
+  gitlab_data:
+  runner_config:
+  deploy_data:
+networks:
+  lab:
+    name: practice3-net

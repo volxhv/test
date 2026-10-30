@@ -1,0 +1,2 @@
+document.querySelector('#app').innerHTML = '<h1>Практическая работа 3</h1><p id="status">Проверка API…</p>';
+fetch('/api/health').then(response => { if (!response.ok) throw new Error('API недоступен'); return response.json(); }).then(data => { document.querySelector('#status').textContent = `API: ${data.status}`; }).catch(() => { document.querySelector('#status').textContent = 'API недоступен'; });

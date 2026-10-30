@@ -1,0 +1,278 @@
+---
+- name: Автоматическая настройка GitLab CI/CD
+  hosts: localhost
+  gather_facts: false
+  vars:
+    project_dir: "{{ lookup('env', 'PROJECT_DIR') }}"
+    api: http://host.docker.internal:8080/api/v4
+    secret_dir: /project/secrets
+  tasks:
+    - name: Проверить путь к каталогу на хосте
+      ansible.builtin.assert:
+        that: [project_dir | length > 1, project_dir.startswith('/')]
+        fail_msg: "PROJECT_DIR должен содержать абсолютный путь к проекту на хосте"
+    - name: Создать каталог секретов
+      ansible.builtin.file:
+        path: "{{ secret_dir }}"
+        state: directory
+        mode: '0700'
+    - name: Создать SSH-ключ для деплоя
+      ansible.builtin.command:
+        argv: [ssh-keygen, -q, -t, ed25519, -N, '', -f, '{{ secret_dir }}/id_ed25519']
+        creates: "{{ secret_dir }}/id_ed25519"
+    - name: Запустить GitLab, runner, SSH и gateway через Docker сокет
+      ansible.builtin.command:
+        argv: [docker, compose, -p, practice3-infra, -f, /project/infra/compose.yml, up, -d, --build]
+      environment:
+        PROJECT_DIR: "{{ project_dir }}"
+      changed_when: true
+    - name: Дождаться страницы входа GitLab (первый запуск может быть долгим)
+      ansible.builtin.uri:
+        url: "http://host.docker.internal:8080/users/sign_in"
+        status_code: 200
+      register: gitlab_wait
+      retries: 90
+      delay: 10
+      until: gitlab_wait.status | default(0) == 200
+    - name: Создать случайный токен администратора и пароль БД на диске
+      ansible.builtin.command:
+        argv: [python3, /project/ansible/create_secrets.py]
+      no_log: true
+      changed_when: false
+    - name: Прочитать административный токен
+      ansible.builtin.slurp:
+        src: "{{ secret_dir }}/gitlab_api_token"
+      register: token_file
+      no_log: true
+    - name: Подготовить токен
+      ansible.builtin.set_fact:
+        gitlab_token: "{{ token_file.content | b64decode | trim }}"
+      no_log: true
+    - name: Создать персональный токен root внутри GitLab
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -p
+          - practice3-infra
+          - -f
+          - /project/infra/compose.yml
+          - exec
+          - -T
+          - -e
+          - "BOOTSTRAP_TOKEN={{ gitlab_token }}"
+          - gitlab
+          - gitlab-rails
+          - runner
+          - "u=User.find_by!(username: 'root'); t=u.personal_access_tokens.new(name: 'practice3-ansible', scopes: ['api'], expires_at: 365.days.from_now); t.set_token(ENV.fetch('BOOTSTRAP_TOKEN')); t.save!"
+        creates: "{{ secret_dir }}/.api_token_registered"
+      environment:
+        PROJECT_DIR: "{{ project_dir }}"
+      no_log: true
+      register: token_setup
+    - name: Запомнить регистрацию токена
+      ansible.builtin.file:
+        path: "{{ secret_dir }}/.api_token_registered"
+        state: touch
+        mode: '0600'
+      when: token_setup is changed
+    - name: Найти учебную группу
+      ansible.builtin.uri:
+        url: "{{ api }}/groups/devops"
+        headers: {PRIVATE-TOKEN: "{{ gitlab_token }}"}
+        status_code: [200, 404]
+      register: group_lookup
+      no_log: true
+    - name: Создать учебную группу
+      ansible.builtin.uri:
+        url: "{{ api }}/groups"
+        method: POST
+        headers: {PRIVATE-TOKEN: "{{ gitlab_token }}"}
+        body_format: json
+        body: {name: devops, path: devops, visibility: private}
+        status_code: 201
+      when: group_lookup.status == 404
+      register: group_created
+      no_log: true
+    - name: Выбрать ID группы
+      ansible.builtin.set_fact:
+        group_id: "{{ group_lookup.json.id if group_lookup.status == 200 else group_created.json.id }}"
+    - name: Найти проект
+      ansible.builtin.uri:
+        url: "{{ api }}/projects/devops%2Fdevops-stack"
+        headers: {PRIVATE-TOKEN: "{{ gitlab_token }}"}
+        status_code: [200, 404]
+      register: project_lookup
+      no_log: true
+    - name: Создать проект с основной веткой main
+      ansible.builtin.uri:
+        url: "{{ api }}/projects"
+        method: POST
+        headers: {PRIVATE-TOKEN: "{{ gitlab_token }}"}
+        body_format: json
+        body:
+          name: devops-stack
+          path: devops-stack
+          namespace_id: "{{ group_id | int }}"
+          visibility: private
+          initialize_with_readme: true
+          default_branch: main
+        status_code: 201
+      when: project_lookup.status == 404
+      register: project_created
+      no_log: true
+    - name: Выбрать ID проекта
+      ansible.builtin.set_fact:
+        project_id: "{{ project_lookup.json.id if project_lookup.status == 200 else project_created.json.id }}"
+    - name: Прочитать пароль БД
+      ansible.builtin.slurp:
+        src: "{{ secret_dir }}/db_password"
+      register: db_file
+      no_log: true
+    - name: Прочитать SSH-ключ деплоя
+      ansible.builtin.slurp:
+        src: "{{ secret_dir }}/id_ed25519"
+      register: key_file
+      no_log: true
+    - name: Получить публичный host key SSH непосредственно из контейнера
+      ansible.builtin.command:
+        argv: [docker, compose, -p, practice3-infra, -f, /project/infra/compose.yml, exec, -T, deploy, cat, /etc/ssh/ssh_host_ed25519_key.pub]
+      environment:
+        PROJECT_DIR: "{{ project_dir }}"
+      register: host_key
+      changed_when: false
+    - name: Записать или обновить защищённые CI/CD-переменные
+      ansible.builtin.include_tasks: variable.yml
+      loop:
+        - {key: SSH_PRIVATE_KEY, value: "{{ key_file.content | b64decode }}", variable_type: file, masked: false}
+        - {key: SSH_KNOWN_HOSTS, value: "deploy {{ host_key.stdout.split()[0] }} {{ host_key.stdout.split()[1] }}", variable_type: file, masked: false}
+        - {key: DB_PASSWORD, value: "{{ db_file.content | b64decode | trim }}", variable_type: env_var, masked: true}
+      loop_control: {loop_var: ci_var}
+      no_log: true
+    - name: Проверить защиту основной ветки
+      ansible.builtin.uri:
+        url: "{{ api }}/projects/{{ project_id }}/protected_branches/main"
+        headers: {PRIVATE-TOKEN: "{{ gitlab_token }}"}
+        status_code: [200, 404]
+      register: protected_branch
+      no_log: true
+    - name: Защитить основную ветку
+      ansible.builtin.uri:
+        url: "{{ api }}/projects/{{ project_id }}/protected_branches"
+        method: POST
+        headers: {PRIVATE-TOKEN: "{{ gitlab_token }}"}
+        body_format: json
+        body: {name: main, push_access_level: 40, merge_access_level: 40}
+        status_code: 201
+      when: protected_branch.status == 404
+      no_log: true
+    - name: Проверить защиту релизных тегов
+      ansible.builtin.uri:
+        url: "{{ api }}/projects/{{ project_id }}/protected_tags/v%2A"
+        headers: {PRIVATE-TOKEN: "{{ gitlab_token }}"}
+        status_code: [200, 404]
+      register: protected_tag
+      no_log: true
+    - name: Защитить релизные теги
+      ansible.builtin.uri:
+        url: "{{ api }}/projects/{{ project_id }}/protected_tags"
+        method: POST
+        headers: {PRIVATE-TOKEN: "{{ gitlab_token }}"}
+        body_format: json
+        body: {name: 'v*', create_access_level: 40}
+        status_code: 201
+      when: protected_tag.status == 404
+      no_log: true
+    - name: Проверить, создан ли токен runner
+      ansible.builtin.stat:
+        path: "{{ secret_dir }}/runner_token"
+      register: runner_token_file
+    - name: Создать project runner через API
+      ansible.builtin.uri:
+        url: "{{ api }}/user/runners"
+        method: POST
+        headers: {PRIVATE-TOKEN: "{{ gitlab_token }}"}
+        body_format: json
+        body:
+          runner_type: project_type
+          project_id: "{{ project_id | int }}"
+          description: practice3-socket-runner
+          tag_list: socket
+          run_untagged: false
+          access_level: not_protected
+        status_code: 201
+      when: not runner_token_file.stat.exists
+      register: runner_created
+      no_log: true
+    - name: Сохранить токен runner
+      ansible.builtin.copy:
+        dest: "{{ secret_dir }}/runner_token"
+        content: "{{ runner_created.json.token }}"
+        mode: '0600'
+      when: not runner_token_file.stat.exists
+      no_log: true
+    - name: Прочитать токен runner
+      ansible.builtin.slurp:
+        src: "{{ secret_dir }}/runner_token"
+      register: runner_secret
+      no_log: true
+    - name: Проверить конфигурацию runner
+      ansible.builtin.command:
+        argv: [docker, compose, -p, practice3-infra, -f, /project/infra/compose.yml, exec, -T, runner, sh, -c, 'if [ -f /etc/gitlab-runner/config.toml ]; then grep -q practice3-socket-runner /etc/gitlab-runner/config.toml; else exit 1; fi']
+      environment: {PROJECT_DIR: "{{ project_dir }}"}
+      register: runner_check
+      changed_when: false
+      failed_when: runner_check.rc not in [0, 1]
+    - name: Зарегистрировать Docker socket runner
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -p
+          - practice3-infra
+          - -f
+          - /project/infra/compose.yml
+          - exec
+          - -T
+          - runner
+          - gitlab-runner
+          - register
+          - --non-interactive
+          - --url
+          - http://gitlab/
+          - --clone-url
+          - http://gitlab/
+          - --token
+          - "{{ runner_secret.content | b64decode | trim }}"
+          - --executor
+          - docker
+          - --docker-image
+          - alpine:3.21
+          - --docker-network-mode
+          - practice3-net
+          - --docker-volumes
+          - /var/run/docker.sock:/var/run/docker.sock
+          - --docker-volumes
+          - /cache
+          - --description
+          - practice3-socket-runner
+      environment: {PROJECT_DIR: "{{ project_dir }}"}
+      when: runner_check.rc == 1
+      no_log: true
+    - name: Разрешить параллельное выполнение четырёх job
+      ansible.builtin.command:
+        argv: [docker, compose, -p, practice3-infra, -f, /project/infra/compose.yml, exec, -T, runner, sh, -c, "sed -i 's/^concurrent = .*/concurrent = 4/' /etc/gitlab-runner/config.toml"]
+      environment: {PROJECT_DIR: "{{ project_dir }}"}
+      changed_when: false
+    - name: Загрузить проект и вызвать pipeline коммитом
+      ansible.builtin.command:
+        argv: [python3, /project/ansible/publish.py]
+      environment:
+        GITLAB_TOKEN: "{{ gitlab_token }}"
+        GIT_TERMINAL_PROMPT: '0'
+      register: publish_result
+      changed_when: "'PUSHED' in publish_result.stdout"
+      no_log: true
+    - name: Сообщить адрес проекта
+      ansible.builtin.debug:
+        msg: "Проект: http://localhost:8080/devops/devops-stack ; откройте Build → Pipelines"
